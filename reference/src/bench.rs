@@ -110,7 +110,7 @@ impl Case {
 fn load_suite(path: Option<&Path>) -> Result<(Vec<Case>, String)> {
     let raw = match path {
         Some(path) => fs::read(path).with_context(|| format!("read {}", path.display()))?,
-        None => include_bytes!("../benches/cases.json").to_vec(),
+        None => include_bytes!("../../benches/cases.json").to_vec(),
     };
     let cases = serde_json::from_slice(&raw).context("invalid benchmark suite")?;
     Ok((cases, hex::encode(Sha256::digest(&raw))))
@@ -952,7 +952,7 @@ async fn extract_operators(dir: &Path, expected_ranks: usize) -> Result<()> {
     let child = tokio::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("../tools/operator_report.py"),
+            include_str!("../../tools/operator_report.py"),
             "--trace-dir",
         ])
         .arg(dir.join("traces"))
@@ -1252,7 +1252,7 @@ mod tests {
     #[test]
     fn range_validation_and_prompt_replay() {
         let cases: Vec<Case> =
-            serde_json::from_slice(include_bytes!("../benches/cases.json")).unwrap();
+            serde_json::from_slice(include_bytes!("../../benches/cases.json")).unwrap();
         let ids: Vec<_> = cases_in_range(&cases, "2-4, 1, 4")
             .unwrap()
             .iter()
@@ -1283,7 +1283,7 @@ mod tests {
     #[test]
     fn bounded_replays_preserve_input_mix_and_verify_rank_ownership() {
         let cases: Vec<Case> =
-            serde_json::from_slice(include_bytes!("../benches/cases.json")).unwrap();
+            serde_json::from_slice(include_bytes!("../../benches/cases.json")).unwrap();
         let mixed = cases
             .iter()
             .find(|case| case.name == "mixed-context")
@@ -1350,7 +1350,7 @@ mod tests {
         assert_eq!(pace.arrival_offset(7), Some(Duration::ZERO));
         assert_eq!(pace.arrival_offset(8), Some(Duration::from_millis(250)));
         let extended: Vec<Case> =
-            serde_json::from_slice(include_bytes!("../benches/extended-context.json")).unwrap();
+            serde_json::from_slice(include_bytes!("../../benches/extended-context.json")).unwrap();
         assert_eq!(cases_in_range(&extended, "@long").unwrap().len(), 10);
         assert_eq!(
             extended[9].input_tokens[0] + extended[9].output_at(0) as usize,

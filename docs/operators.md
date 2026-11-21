@@ -30,7 +30,7 @@
 
 ```bash
 # 构建机，示例目标为 A2、ARM64。变更工作区中的源码后再次执行同一命令。
-bash build.sh --profiles a2 --platform linux/arm64 --out dist-a2
+bash build-reference.sh --profiles a2 --platform linux/arm64 --out dist-a2
 
 # 目标机，在解压后的软件包目录执行
 ./run.sh --hardware a2 --model /data/models/DeepSeek-V4-Flash-0731-w8a8 \

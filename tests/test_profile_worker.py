@@ -22,7 +22,7 @@ class ProfileWorkerTests(unittest.TestCase):
             "vllm.distributed.parallel_state": SimpleNamespace(get_dp_group=group, get_tp_group=group),
             "vllm_ascend.worker.worker": SimpleNamespace(NPUWorker=object),
         }
-        path = Path(__file__).resolve().parents[1] / "runtime/bench_worker.py"
+        path = Path(__file__).resolve().parents[1] / "reference/runtime/bench_worker.py"
         with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, dependencies), patch.dict(
             os.environ, ANYINFER_BENCH_RUN=tmp, ASCEND_RT_VISIBLE_DEVICES="3"
         ):

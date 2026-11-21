@@ -13,8 +13,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 INPUTS = (
     ".gitattributes", ".gitignore", "Cargo.toml", "Cargo.lock", "README.md",
-    "build.sh", "benchmark.sh", "run.sh", "src", "runtime", "benches", "tests",
-    "tools", "docs", "deploy", "operators",
+    "build.sh", "benchmark.sh", "run-reference.sh", "src", "benches", "tests",
+    "reference", "native", "tools", "docs", "deploy", "operators", "build-reference.sh", "benchmark-reference.sh", "README-reference.md",
 )
 
 
@@ -29,7 +29,7 @@ def package(out):
             raise FileNotFoundError(path)
         candidates = path.rglob("*") if path.is_dir() else [path]
         files.extend(p.relative_to(ROOT) for p in candidates if p.is_file()
-                     and "__pycache__" not in p.parts and p.suffix not in {".pyc", ".pyo"})
+                     and "__pycache__" not in p.parts and "target" not in p.parts and p.suffix not in {".pyc", ".pyo"})
     executables = set((ROOT / "operators/executable-files.txt").read_text(encoding="utf-8").splitlines())
     version = re.search(r'^version = "([^"]+)"', (ROOT / "Cargo.toml").read_text(), re.M)[1]
     out.mkdir(parents=True, exist_ok=True)

@@ -2,18 +2,18 @@
 
 ## 准备编译环境
 
-在可以访问镜像仓库和 crates.io 的 Linux 构建机上运行以下命令。需要 Python 3.10+、Bash、启用 BuildKit 的 Docker Engine、GNU coreutils、tar 和 gzip。构建机可以没有 NPU。默认生成与构建机 CPU 架构匹配的包，在匹配 A2、A3、A5 的 CANN 工具链中分别构建算子。如果构建机和部署机的 CPU 架构不同，构建机的 Docker 需要已配置对应的 binfmt/QEMU。包的 CPU 架构须与目标机相同。完整操作示例见[使用手册](user-manual.md)。
+在可以访问镜像仓库和 crates.io 的 Linux 构建机上运行以下命令。需要 Python 3.10+、Bash、启用 BuildKit 的 Docker Engine、GNU coreutils、tar 和 gzip。构建机可以没有 NPU。默认生成与构建机 CPU 架构匹配的包，在匹配 A2、A3、A5 的 CANN 工具链中分别构建算子。如果构建机和部署机的 CPU 架构不同，构建机的 Docker 需要已配置对应的 binfmt/QEMU。包的 CPU 架构须与目标机相同。完整操作示例见[使用手册](reference-manual.md)。
 
 ```bash
-bash build.sh
+bash build-reference.sh
 # 一份包交付给混合 CPU 机群，根目录的 run.sh 自动识别当前主机架构
-bash build.sh --platform all
+bash build-reference.sh --platform all
 # 只给 A2 测试机出包
-bash build.sh --profiles a2 --platform linux/arm64 --out dist-a2
+bash build-reference.sh --profiles a2 --platform linux/arm64 --out dist-a2
 # 给 x86_64 主机上的 A3 卡出包
-bash build.sh --profiles a3 --platform linux/amd64 --out dist-x86
+bash build-reference.sh --profiles a3 --platform linux/amd64 --out dist-x86
 # 只导出可编辑的算子源代码和编译入口，不需要 Docker
-bash build.sh --sources-only --out dist
+bash build-reference.sh --sources-only --out dist
 ```
 
 脚本用锁定的 Cargo 依赖运行 release 测试、编译各运行时可执行的 musl 二进制，再在每个选定的镜像中启动二进制检查 CLI。构建成功会在输出路径发布可直接分发的 `anyinfer/` 目录，以及同级的 `anyinfer-<CPU>-<时间>-<随机串>.tar.gz` 和校验文件。目录内有 `benchmark.sh`、二进制、模型运行时镜像、用例、结果分析工具和构建清单。请为 Docker 镜像、展开目录、历史版本和最终压缩包预留磁盘空间。下一次构建复用同一构建机上的 Cargo 缓存卷。
@@ -22,22 +22,22 @@ bash build.sh --sources-only --out dist
 
 ## 修改算子、模型执行或调度代码
 
-算子源代码位于 `operators/vllm-ascend/csrc/`，包含 Ascend C 内核、tiling、算子注册和 PyTorch C++ 桥接。模型调用代码和 Triton 实现位于同一源码树下的 `vllm_ascend/`。例如，修改 HcPost 可从 `csrc/moe/hc_post/op_kernel/` 开始。仓库和解压后的完整软件包都包含可编辑源码、Catlass 头文件、锁定的构建依赖、许可与同一个 `build.sh`。[算子源码与索引](operators.md)
+算子源代码位于 `operators/vllm-ascend/csrc/`，包含 Ascend C 内核、tiling、算子注册和 PyTorch C++ 桥接。模型调用代码和 Triton 实现位于同一源码树下的 `vllm_ascend/`。例如，修改 HcPost 可从 `csrc/moe/hc_post/op_kernel/` 开始。仓库和解压后的完整软件包都包含可编辑源码、Catlass 头文件、锁定的构建依赖、许可与同一个 `build-reference.sh`。[算子源码与索引](operators.md)
 
-每轮构建另行输出 `anyinfer-operators-<源码散列>-<批次>.tar.gz` 及 SHA-256 文件。这个源码归档含编译上下文、算子目录索引和原始源码，可独立传回编码环境。如果只需在编译机重建算子镜像，在解压后的 `anyinfer-operators/` 中执行 `./build-image.sh a2 linux/arm64`（可选 `a3`、`a5`、`linux/amd64`）。若要把算子、Rust 引擎和用例一起部署，使用完整工程或完整软件包根目录的 `bash build.sh`。
+每轮构建另行输出 `anyinfer-operators-<源码散列>-<批次>.tar.gz` 及 SHA-256 文件。这个源码归档含编译上下文、算子目录索引和原始源码，可独立传回编码环境。如果只需在编译机重建算子镜像，在解压后的 `anyinfer-operators/` 中执行 `./build-image.sh a2 linux/arm64`（可选 `a3`、`a5`、`linux/amd64`）。若要把算子、Rust 引擎和用例一起部署，使用完整工程或完整软件包根目录的 `bash build-reference.sh`。
 
-再次运行 `bash build.sh --profiles a2` 时，构建器校验本轮源码散列，使用匹配设备的 CANN 与 PyTorch 环境编译新 wheel，生成 Torch 扩展、vendor 自定义算子包和设备内核对象，随后将这些文件安装至镜像的 `/opt/anyinfer/operators/python`。每种硬件使用独立的构建产物；算子编译或产物检查失败会停止出包。构建清单记录基础镜像、编译器版本、原始代码、wheel 与已安装文件的 SHA-256。修改源码会使对应的 Docker 构建缓存失效，源码没有变化的迭代可复用已编译层。
+再次运行 `bash build-reference.sh --profiles a2` 时，构建器校验本轮源码散列，使用匹配设备的 CANN 与 PyTorch 环境编译新 wheel，生成 Torch 扩展、vendor 自定义算子包和设备内核对象，随后将这些文件安装至镜像的 `/opt/anyinfer/operators/python`。每种硬件使用独立的构建产物；算子编译或产物检查失败会停止出包。构建清单记录基础镜像、编译器版本、原始代码、wheel 与已安装文件的 SHA-256。修改源码会使对应的 Docker 构建缓存失效，源码没有变化的迭代可复用已编译层。
 
 目标机启动时核对库文件哈希、导入路径、CANN 的 OPP 搜索顺序和 NPU 算子注册，并用第一张选定的物理设备执行 HcPost，对照 CPU 参考输出。检查失败会在加载模型之前退出。算子级冒烟结果与端到端 golden 测试分别保存在结果目录。前者验证桥接和内核调用，后者检查模型生成。
 
-把改过的后端文件按原包的模块路径放入源码树的 `backend-overlay/vllm/` 或 `backend-overlay/vllm_ascend/`。例如，修改了上游 v1 调度器时，将对应版本的完整文件写入 `backend-overlay/vllm/v1/core/sched/scheduler.py`。运行同一个 `bash build.sh` 命令即可。构建器用本地 Docker BuildKit 从每个选中的基础镜像生成派生镜像，定位实际 Python 包目录、检查 Python 语法并覆盖文件，随后将派生镜像导出到软件包。每次回传包含文件散列 `build/overlay.sha256`、原始基础镜像 ID `build/<机型>.base.id` 和最终运行镜像 ID `build/<机型>.id`。建议先提交用于对照的基线，再为同一用例生成包含后端修改的包。
+把改过的后端文件按原包的模块路径放入源码树的 `backend-overlay/vllm/` 或 `backend-overlay/vllm_ascend/`。例如，修改了上游 v1 调度器时，将对应版本的完整文件写入 `backend-overlay/vllm/v1/core/sched/scheduler.py`。运行同一个 `bash build-reference.sh` 命令即可。构建器用本地 Docker BuildKit 从每个选中的基础镜像生成派生镜像，定位实际 Python 包目录、检查 Python 语法并覆盖文件，随后将派生镜像导出到软件包。每次回传包含文件散列 `build/overlay.sha256`、原始基础镜像 ID `build/<机型>.base.id` 和最终运行镜像 ID `build/<机型>.id`。建议先提交用于对照的基线，再为同一用例生成包含后端修改的包。
 
 overlay 可以调整 Python 前端或调度器。要修改 C++、Ascend C 或插件自己的算子实现，直接编辑 `operators/` 后重新构建；安装路径中的原生扩展和 vendor 包由本地编译产物生成。
 
 默认镜像基于上游 0.30.0。A2 使用 `quay.io/ascend/vllm-ascend:v0.30.0`，A3 和 A5 分别使用带 `-a3` 和 `-a5` 后缀的标签。脚本把实际镜像 ID 和仓库摘要写入清单。使用内部仓库时，可以给 `ANYINFER_BUILDER_IMAGE` 和各 `ANYINFER_IMAGE_A2`、`ANYINFER_IMAGE_A3`、`ANYINFER_IMAGE_A5` 指定镜像。优化后端算子或调度代码时，可在对应官方镜像上构建含改动的派生镜像，再一键打包。例如，以下命令使用本地 A3 派生镜像。使用 `--local-images` 时，构建镜像也必须存在于本地。构建 Rust 依赖仍需要可用的 Cargo 缓存或镜像源。[官方昇腾镜像与模型部署说明](https://docs.vllm.ai/projects/ascend/en/v0.30.0/tutorials/models/DeepSeek-V4-Flash.html#docker-image-installation)
 
 ```bash
-ANYINFER_IMAGE_A3=my-v4-kernel:exp17 bash build.sh --profiles a3 --local-images
+ANYINFER_IMAGE_A3=my-v4-kernel:exp17 bash build-reference.sh --profiles a3 --local-images
 ```
 
 ## 部署包与模型

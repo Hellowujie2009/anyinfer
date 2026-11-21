@@ -1,223 +1,137 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-usage() {
-  cat <<'EOF'
-Usage: bash build.sh [--profiles a2,a3,a5] [--platform linux/arm64|linux/amd64|all] [--out DIR] [--local-images] [--sources-only]
-Build and test the Rust binary and Ascend kernels, then publish DIR/anyinfer/ and a matching archive.
-The published directory contains benchmark.sh, runtime images, cases, sources and docs/user-manual.md.
-Defaults: all hardware profiles, the build host CPU architecture, dist/. Requires Linux and Docker.
-EOF
-}
-die() { echo "build: $*" >&2; exit 1; }
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-profiles=a2,a3,a5
-platform=''
-local_images=0
-sources_only=0
 out="$root/dist"
+socs=()
+sources=0
+host_only=0
 while (($#)); do
   case "$1" in
-    --help|-h) usage; exit 0 ;;
-    --profiles) profiles=${2:?missing profile list}; shift 2 ;;
-    --platform) platform=${2:?missing platform}; shift 2 ;;
+    --soc) socs+=("${2:?missing CANN SoC version}"); shift 2 ;;
     --out) out=${2:?missing output directory}; shift 2 ;;
-    --local-images) local_images=1; shift ;;
-    --sources-only) sources_only=1; shift ;;
-    *) die "unknown option $1" ;;
+    --sources-only) sources=1; shift ;;
+    --host-only) host_only=1; shift ;;
+    -h|--help) cat <<'EOF'
+bash build.sh --soc Ascend910B1 [--soc ANOTHER_CANN_SOC] [--out DIR]
+bash build.sh --sources-only [--out DIR]
+bash build.sh --host-only [--out DIR]
+Build the standalone Rust tools and native V4 Ascend kernel benchmark with the
+installed CANN SDK. DIR/anyinfer is the deployable directory. Use the exact
+CANN SoC version of your target. build-reference.sh builds the vLLM baseline.
+The host-only build uses Cargo and ships DIR/anyinfer-host for CPU scheduler tests.
+EOF
+      exit 0 ;;
+    *) echo "Unknown build option: $1" >&2; exit 2 ;;
   esac
 done
-if [[ -z "$platform" ]]; then
-  case "$(uname -m)" in
-    arm64|aarch64) platform=linux/arm64 ;;
-    x86_64) platform=linux/amd64 ;;
-    *) die "unsupported host architecture; specify --platform" ;;
-  esac
+if ((host_only && (sources || ${#socs[@]}))); then
+  echo "--host-only cannot be combined with --soc or --sources-only" >&2
+  exit 2
 fi
-[[ "$platform" == linux/arm64 || "$platform" == linux/amd64 || "$platform" == all ]] || die "unsupported platform: $platform"
-[[ "$profiles" =~ ^(a[235])(,a[235])*$ ]] || die "expected comma-separated a2, a3, a5"
-archive_arch=${platform#linux/}
-builder=${ANYINFER_BUILDER_IMAGE:-rust:1.100.0-alpine3.23}
-mkdir -p "$out"
-out=$(cd "$out" && pwd)
-stage=$(mktemp -d "$out/.build-XXXXXXXX")
+name=anyinfer
+if ((host_only)); then name=anyinfer-host; fi
+mkdir -p -- "$out"
+out=$(cd "$out" && pwd -P)
+stage=$(mktemp -d "$out/.anyinfer-native-XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
+bundle="$stage/$name"
+mkdir -p "$bundle"/{src/native,docs,native,tests}
 cd "$root"
-export PYTHONDONTWRITEBYTECODE=1
-python3 -m unittest discover -s tests
-work_context="$stage/anyinfer-operators"
-mkdir -p "$work_context/overlay/files"
-cp -a operators "$work_context/operators"
-install -m 644 deploy/operators.Dockerfile "$work_context/Dockerfile"
-install -m 644 deploy/compile-operators.sh deploy/operator_integrity.py deploy/calibrate.py "$work_context/"
-install -m 755 deploy/build-operator-image.sh "$work_context/build-image.sh"
-install -m 644 deploy/apply_overlay.py "$work_context/overlay/"
-(cd "$work_context" && find operators -type f ! -path '*/__pycache__/*' -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > operator-source.sha256)
-operator_source_sha=$(sha256sum "$work_context/operator-source.sha256" | cut -d' ' -f1)
-python3 tools/operator_catalog.py --root "$work_context/operators" --output "$stage/operator-index.json"
-overlay=''
-if [[ -e backend-overlay ]]; then
-  [[ -d backend-overlay && ! -L backend-overlay ]] || die "backend-overlay must be a directory"
-  if [[ -n "$(find backend-overlay -mindepth 1 ! -type d -print -quit)" ]]; then
-    overlay="$work_context/overlay"
-    cp -a backend-overlay/. "$overlay/files/"
-  fi
+install -m 644 Cargo.toml Cargo.lock README.md "$bundle/"
+install -m 755 build.sh benchmark.sh "$bundle/"
+install -m 644 docs/user-manual.md docs/native-model.md "$bundle/docs/"
+install -m 644 src/{lib,main,opbench,scheduler_bench,host_observation}.rs "$bundle/src/"
+install -m 644 tests/host_decode_allocations.rs "$bundle/tests/"
+install -m 644 src/native/*.rs "$bundle/src/native/"
+cp -a native/. "$bundle/native/"
+(cd "$bundle" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$stage/source.sha256")
+source_sha=$(sha256sum "$stage/source.sha256" | cut -c1-12)
+version=$(awk -F'"' '/^version = /{print $2;exit}' Cargo.toml)
+if (( sources )); then
+  archive="anyinfer-native-source-$version-$source_sha.tar.gz"
+  tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$stage" -cf - anyinfer | gzip -n > "$stage/$archive"
+  mv -f "$stage/$archive" "$out/$archive"
+  (cd "$out" && sha256sum "$archive" > "$archive.sha256")
+  echo "$out/$archive"
+  exit 0
 fi
-
-mkdir -p "$work_context/docs"
-install -m 644 docs/*.md "$work_context/docs/"
-install -m 644 "$stage/operator-index.json" tools/operator_catalog.py "$work_context/"
-time_label="$(date -u +%Y%m%dT%H%M%SZ)-${stage##*-}"
-source_archive="anyinfer-operators-${operator_source_sha:0:12}-$time_label.tar.gz"
-tar -C "$stage" -cf - anyinfer-operators | gzip -1 > "$stage/$source_archive"
-mv "$stage/$source_archive" "$out/$source_archive"
-(cd "$out" && sha256sum "$source_archive" > "$source_archive.sha256")
-printf 'Operator sources: %s\n' "$out/$source_archive"
-if ((sources_only)); then exit 0; fi
-
-inspect_image() {
-  docker image inspect --platform "$platform" --format "$1" "$2" 2>/dev/null ||
-    docker image inspect --format "$1" "$2"
-}
-
-build_operators() (
-  base_tag="anyinfer-build-base:${stage##*-}-$arch-$hw"
-  docker tag "$image" "$base_tag"
-  trap 'if [[ "$(docker image inspect --format "{{len .RepoTags}}" "$base_tag" 2>/dev/null)" -gt 1 ]]; then docker image rm --no-prune "$base_tag" >/dev/null; fi' EXIT
-  ANYINFER_BASE_IMAGE="$base_tag" ANYINFER_IIDFILE="$stage/derived-$arch-$hw.id" \
-    bash "$work_context/build-image.sh" "$hw" "$platform"
-)
-
-package_platform() (
-platform=$1
-bundle=$2
-arch=${platform#linux/}
-builder_override=ANYINFER_BUILDER_IMAGE_${arch^^}
-builder=${!builder_override:-$builder}
-mkdir -p "$bundle"/{assets/bin,assets/benches,images,build,docs,tools}
-install -m 755 "$root/run.sh" "$root/benchmark.sh" "$bundle/"
-install -m 755 "$root/deploy/entrypoint.sh" "$bundle/assets/entrypoint.sh"
-install -m 644 "$root/deploy/calibrate.py" "$bundle/assets/calibrate.py"
-install -m 644 "$root/benches/cases.json" "$bundle/assets/benches/cases.json"
-install -m 644 "$root/benches/accuracy-prompts.jsonl" "$bundle/assets/benches/accuracy-prompts.jsonl"
-install -m 644 "$root"/docs/*.md "$bundle/docs/"
-install -m 644 "$root/README.md" "$bundle/README.md"
-install -m 644 "$root/tools/"{report,operator_report,operator_catalog,communication_report}.py "$bundle/tools/"
-install -m 644 "$root/Cargo.lock" "$bundle/build/Cargo.lock"
-install -m 644 "$stage/operator-index.json" "$bundle/assets/operator-index.json"
-install -m 644 "$work_context/operator-source.sha256" "$bundle/build/operator-source.sha256"
-install -m 644 "$work_context/operators/SOURCE.json" "$bundle/build/operator-upstream.json"
-cd "$root"
-source_inputs=(src runtime tools benches Cargo.toml Cargo.lock build.sh benchmark.sh run.sh deploy README.md docs)
-if [[ -n "$overlay" ]]; then
-  source_inputs+=(backend-overlay)
-  (cd "$overlay/files" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) > "$bundle/build/overlay.sha256"
-fi
-[[ ! -d tests ]] || source_inputs+=(tests)
-find "${source_inputs[@]}" -type f ! -path '*/__pycache__/*' -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$bundle/build/source.sha256"
-{
-  printf 'built_utc=%s\nplatform=%s\nprofiles=%s\n' "$(date -u +%FT%TZ)" "$platform" "$profiles"
-  commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
-  printf 'git_commit=%s\n' "$commit"
-  printf 'source_manifest_sha256=%s\n' "$(sha256sum "$bundle/build/source.sha256" | cut -d' ' -f1)"
-  printf 'operator_source_manifest_sha256=%s\n' "$operator_source_sha"
-  printf 'operator_source_archive=%s\n' "$source_archive"
-} > "$bundle/build/build.txt"
-
-# A native musl target produces a binary usable across all three CANN base images.
-if ((!local_images)); then docker pull --platform "$platform" "$builder"; fi
-builder_id=$(inspect_image '{{.Id}}' "$builder")
-[[ "$(inspect_image '{{.Os}}/{{.Architecture}}' "$builder")" == "$platform" ]] || die "builder and target architecture differ"
-docker run --rm --platform "$platform" -v "$root:/src:ro" -w /src \
-  -v "$bundle/assets/bin:/out" -v "$bundle/build:/meta" \
-  -v "anyinfer-cargo-registry:/usr/local/cargo/registry" \
-  -v "anyinfer-target-$arch:/target" -e CARGO_TARGET_DIR=/target \
-  -e "RESULT_OWNER=$(id -u):$(id -g)" "$builder" sh -ec '
-    target=$(rustc -vV | sed -n "s/^host: //p")
-    rustc -vV > /meta/rustc.txt
-    cargo test --locked --target "$target" --release
-    cargo build --locked --target "$target" --release --bin anyinfer
-    cp "/target/$target/release/anyinfer" /out/anyinfer
-    chmod 755 /out/anyinfer
-    chown "$RESULT_OWNER" /out/anyinfer /meta/rustc.txt
-  '
-printf 'builder=%s\nbuilder_id=%s\n' "$builder" "$builder_id" >> "$bundle/build/build.txt"
-
-IFS=, read -r -a selected <<< "$profiles"
-save_flags=()
-if [[ "$(docker image save --help)" == *--platform* ]] &&
-    docker version --format '{{.Server.APIVersion}}' | awk -F. '{exit !($1 > 1 || ($1 == 1 && $2 >= 48))}'; then
-  save_flags+=(--platform "$platform")
-fi
-for hw in "${selected[@]}"; do
-  [[ ! -e "$bundle/build/$hw.id" ]] || die "duplicate profile $hw"
-  suffix="-$hw"
-  [[ "$hw" != a2 ]] || suffix=
-  override=ANYINFER_IMAGE_${hw^^}
-  image=${!override:-quay.io/ascend/vllm-ascend:v0.30.0$suffix}
-  override=ANYINFER_IMAGE_${hw^^}_${arch^^}
-  image=${!override:-$image}
-  if ((!local_images)); then docker pull --platform "$platform" "$image"; fi
-  id=$(inspect_image '{{.Id}}' "$image")
-  actual_platform=$(inspect_image '{{.Os}}/{{.Architecture}}' "$image")
-  [[ "$actual_platform" == "$platform" ]] || die "$image resolved to $actual_platform"
-  docker image inspect --format '{{json .RepoDigests}}' "$image" > "$bundle/build/$hw.repo-digests.json"
-  printf '%s\n' "$id" > "$bundle/build/$hw.base.id"
-  case "$hw" in
-    a2) soc=ascend910b1 ;;
-    a3) soc=ascend910_9391 ;;
-    a5) soc=ascend950dt_9582 ;;
-  esac
-  build_operators
-  id=$(cat "$stage/derived-$arch-$hw.id")
-  printf '%s\n' "$id" > "$bundle/build/$hw.id"
-  tagged=anyinfer-runtime:"$arch-$hw-${id#sha256:}"
-  docker tag "$id" "$tagged"
-  printf '%s\n' "$tagged" > "$bundle/build/$hw.ref"
-  inspect_image '{{json .RootFS.Layers}}' "$tagged" > "$bundle/build/$hw.layers.json"
-  printf '%s=%s\n' "$hw" "$image" >> "$bundle/build/build.txt"
-  docker run --rm --platform "$platform" --entrypoint cat "$tagged" \
-    /opt/anyinfer/operators/manifest.json > "$bundle/build/$hw.operators.json"
-  python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); sys.exit(0 if m["source_manifest_sha256"] == sys.argv[2] and m["device_kernel_files"] > 0 and m["soc"] == sys.argv[3] else 1)' \
-    "$bundle/build/$hw.operators.json" "$operator_source_sha" "$soc"
-  docker run --rm --platform "$platform" --entrypoint cat "$tagged" \
-    /opt/anyinfer/operators/compiler.txt > "$bundle/build/$hw.compiler.txt"
-  docker run --platform "$platform" --rm -v "$bundle/assets:/app:ro" \
-    --entrypoint /app/bin/anyinfer "$tagged" --help >/dev/null
-  docker run --rm --platform "$platform" --entrypoint python3 "$tagged" -c '
-import importlib.util, os, pathlib
-binary = pathlib.Path(importlib.util.find_spec("vllm").origin).with_name("vllm-rs")
-print(f"{binary} executable={os.access(binary, os.X_OK) and binary.is_file()}")
-' > "$bundle/build/$hw.frontend.txt"
-  if ! grep -q 'executable=True' "$bundle/build/$hw.frontend.txt"; then
-    echo "Warning: $image does not contain an executable vllm-rs. Use --frontend python with this image." >&2
-  fi
-  docker image save "${save_flags[@]}" -o "$bundle/images/$hw.tar" "$tagged"
+((host_only || ${#socs[@]})) || { echo "Select --host-only or specify the target's CANN --soc (e.g. Ascend910B1)." >&2; exit 2; }
+for soc in "${socs[@]}"; do
+  [[ "$soc" =~ ^[A-Za-z0-9_]+$ ]] || { echo "Invalid SoC version: $soc" >&2; exit 2; }
 done
-(cd "$bundle" && sha256sum assets/bin/anyinfer assets/entrypoint.sh assets/calibrate.py assets/operator-index.json assets/benches/* run.sh benchmark.sh tools/*.py build/*.id build/*.ref build/*.layers.json build/*.operators.json build/*.frontend.txt build/operator-source.sha256 > build/payload.sha256)
-)
-bundle="$stage/anyinfer"
-if [[ "$platform" == all ]]; then
-  mkdir -p "$bundle"/{platforms,docs,tools}
-  install -m 755 run.sh benchmark.sh "$bundle/"
-  install -m 644 docs/package.md "$bundle/docs/package.md"
-  install -m 644 README.md "$bundle/README.md"
-  for cpu in arm64 amd64; do package_platform "linux/$cpu" "$bundle/platforms/$cpu"; done
-else
-  package_platform "$platform" "$bundle"
+setup_cann() {
+  if [[ -n ${ASCEND_HOME_PATH:-} ]]; then return; fi
+  local script
+  for script in /usr/local/Ascend/cann/set_env.sh /usr/local/Ascend/ascend-toolkit/set_env.sh; do
+    if [[ -r "$script" ]]; then
+      set +u
+      source "$script"
+      set -u
+      return
+    fi
+  done
+}
+if ((!host_only)); then
+  setup_cann
+  : "${ASCEND_HOME_PATH:?source your CANN toolkit set_env.sh first}"
 fi
-# The unpacked archive can itself be edited and rebuilt on a compiler host.
-mv "$work_context/operators" "$bundle/operators"
-install -m 755 build.sh "$bundle/build.sh"
-install -m 644 Cargo.toml Cargo.lock .gitattributes .gitignore "$bundle/"
-source_dirs=(src runtime benches deploy docs tools)
-if [[ -d tests ]]; then source_dirs+=(tests); fi
-tar --exclude='__pycache__' -cf - "${source_dirs[@]}" | tar -xf - -C "$bundle"
-if [[ -n "$overlay" ]]; then cp -a "$overlay/files" "$bundle/backend-overlay"; fi
-archive=anyinfer-"$archive_arch"-"$time_label".tar.gz
-printf '%s\n' 'anyinfer-release-v1' > "$bundle/release-format.txt"
-tar -C "$stage" -cf - anyinfer | gzip -1 > "$stage/$archive"
+mkdir -p "$bundle"/{bin,build,kernels}
+install -m 644 "$stage/source.sha256" "$bundle/build/source.sha256"
+# Source archives normalize timestamps. Key the Cargo output by content so a
+# previously unpacked version cannot be reused after overwriting a source tree.
+target_dir="${CARGO_TARGET_DIR:-$root/target}/anyinfer-native-$source_sha"
+mkdir -p "$target_dir"
+target_dir=$(cd "$target_dir" && pwd -P)
+cd "$bundle"
+cargo test --locked --release --lib --bin anyinfer --test host_decode_allocations --target-dir "$target_dir"
+cargo build --locked --release --bin anyinfer --target-dir "$target_dir"
+install -m 755 "$target_dir/release/anyinfer" "$bundle/bin/"
+if ((!host_only)); then
+  cmake -S native/head_runner -B "$stage/head-runner" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$bundle"
+  cmake --build "$stage/head-runner" --parallel
+  cmake --install "$stage/head-runner"
+  "$bundle/bin/anyinfer" list-cases > "$bundle/build/cases.json"
+fi
+{
+  printf 'source=%s\nutc=%s\ncpu=%s\nsocs=%s\n' "$source_sha" "$(date -u +%FT%TZ)" "$(uname -m)" "${socs[*]}"
+  rustc -vV
+  if ((!host_only)); then
+    cmake --version | head -n 1
+    for f in "$ASCEND_HOME_PATH/version.info" "$ASCEND_HOME_PATH/../version.info"; do
+      if [[ -f "$f" ]]; then cat "$f"; break; fi
+    done
+  fi
+} > "$bundle/build/build.txt"
+for soc in "${socs[@]}"; do
+  prefix="$bundle/kernels/$soc"
+  cmake -S native/acl_backend -B "$stage/cmake-$soc" -DSOC_VERSION="$soc" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix"
+  cmake --build "$stage/cmake-$soc" --parallel
+  ctest --test-dir "$stage/cmake-$soc" --output-on-failure
+  cmake --install "$stage/cmake-$soc"
+  test -x "$prefix/bin/anyinfer-hc-post-bench"
+done
+kind=native
+if ((host_only)); then kind=host; fi
+format="anyinfer-$kind-release-v1"
+printf '%s\n' "$format" > "$bundle/release-format.txt"
+(cd "$bundle" && find bin kernels -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > build/payload.sha256)
+archive="anyinfer-$kind-$version-$(uname -m)-$source_sha-${stage##*-}.tar.gz"
+tar -C "$stage" -cf - "$name" | gzip -1 > "$stage/$archive"
 (cd "$stage" && sha256sum "$archive" > "$archive.sha256")
-python3 deploy/publish_release.py "$stage" "$archive"
-printf 'Deployment directory: %s\nBenchmark entry: %s\nPackage: %s\nChecksum: %s\n' \
-  "$out/anyinfer" "$out/anyinfer/benchmark.sh" "$out/$archive" "$out/$archive.sha256"
+# Serialize publication if several builds target the same output directory.
+exec 9>"$out/.native-publish.lock"
+flock 9
+dest="$out/$name"
+if [[ -e "$dest" || -L "$dest" ]]; then
+  [[ ! -L "$dest" && -f "$dest/release-format.txt" &&
+     $(cat "$dest/release-format.txt") == "$format" ]] ||
+    { echo "$dest already exists with a different format; select --out DIR" >&2; exit 1; }
+  mv "$dest" "$stage/previous"
+fi
+if ! mv "$bundle" "$dest"; then
+  if [[ -d "$stage/previous" ]]; then mv "$stage/previous" "$dest"; fi
+  exit 1
+fi
+mv "$stage/$archive" "$stage/$archive.sha256" "$out/"
+printf 'Deployment: %s\nBenchmark: %s\nPackage: %s\n' "$dest" "$dest/benchmark.sh" "$out/$archive"

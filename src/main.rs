@@ -1,177 +1,99 @@
-mod accuracy;
-mod bench;
-mod offline;
-mod runtime;
+#[path = "../native/head_runner/mod.rs"]
+mod head_runner;
+mod host_observation;
+mod opbench;
+mod scheduler_bench;
 
-use std::net::SocketAddr;
+use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use runtime::{Runtime, RuntimeConfig};
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     version,
-    about = "DeepSeek V4 inference and benchmarking on a single Ascend host"
+    about = "Native DeepSeek V4 checkpoint tools and Ascend kernel benchmarks"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand)]
 enum Command {
-    /// List matching workloads without starting the inference engine.
+    /// Compute trusted head logits from a BF16 residual and checkpoint weights on the CPU.
+    GoldenHead {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        residual: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Measure host-side continuous batching bookkeeping with an empty device dispatch.
+    SchedulerBench,
+    /// Evaluate the compiled vocabulary head shards on local Ascend devices.
+    RunHead(head_runner::Options),
+    /// Read the checkpoint index, validate tensor metadata and show mHC dimensions.
+    Inspect {
+        #[arg(long)]
+        model: PathBuf,
+    },
+    /// Export the weighted V4 final head for one vocabulary shard, including the BF16 rounding boundaries.
+    PrepareHead {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        rank: u32,
+        #[arg(long, default_value_t = 1)]
+        world_size: u32,
+    },
+    /// List native kernel workloads and their stable IDs.
     ListCases {
-        /// Use a supplied workload suite in place of the bundled cases.
-        #[arg(long, env = "ANYINFER_CASE_CATALOG")]
-        cases: Option<std::path::PathBuf>,
-        /// Workload families, inclusive ranges or individual IDs, for example @survey or 1,7,100-120.
         #[arg(long, default_value = "all")]
         range: String,
     },
-    /// Serve the loaded model through the OpenAI-compatible HTTP API.
-    Serve {
-        #[command(flatten)]
-        runtime: RuntimeConfig,
-        #[arg(long, default_value = "127.0.0.1:8000")]
-        listen: SocketAddr,
-    },
-    /// Generate completions for a JSON Lines file, keeping the model resident.
-    Offline {
-        #[command(flatten)]
-        runtime: RuntimeConfig,
-        #[command(flatten)]
-        jobs: offline::OfflineArgs,
-    },
-    /// Load the model once, then run the selected benchmark workloads.
-    Bench {
-        #[command(flatten)]
-        runtime: RuntimeConfig,
-        #[command(flatten)]
-        cases: bench::BenchArgs,
-    },
-    /// Verify greedy token IDs or capture reference outputs using a local checkpoint.
-    Accuracy {
-        #[command(flatten)]
-        runtime: RuntimeConfig,
-        #[command(flatten)]
-        checks: accuracy::AccuracyArgs,
-    },
-    /// Capture golden outputs from an independently trusted, running reference service.
-    Capture {
-        /// Reference HTTP API including its /v1 prefix.
-        #[arg(long)]
-        reference_url: reqwest::Url,
-        #[command(flatten)]
-        checks: accuracy::AccuracyArgs,
-    },
+    /// Run the native Ascend kernel suite on one selected device.
+    Bench(opbench::Args),
 }
 
-async fn termination_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            r = tokio::signal::ctrl_c() => r?,
-            _ = term.recv() => (),
-        }
-    }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
-    Ok(())
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let command = Cli::parse().command;
-    let config = match &command {
-        Command::ListCases { cases, range } => return bench::list_cases(cases.as_deref(), range),
-        Command::Serve { runtime, .. }
-        | Command::Offline { runtime, .. }
-        | Command::Bench { runtime, .. }
-        | Command::Accuracy { runtime, .. } => runtime,
-        Command::Capture {
-            reference_url,
-            checks,
+fn main() -> Result<()> {
+    match Cli::parse().command {
+        Command::GoldenHead {
+            model,
+            residual,
+            output,
         } => {
-            anyhow::ensure!(
-                reference_url.scheme() == "http",
-                "reference URL must use http"
-            );
-            anyhow::ensure!(
-                checks.capture_prompts.is_some(),
-                "capture requires --capture-prompts"
-            );
-            checks.validate(usize::MAX)?;
-            return accuracy::run(checks, reference_url.as_str().trim_end_matches('/')).await;
+            let report = anyinfer::native::model::golden_head(&model, &residual, &output)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
-    };
-    let bench_run = if let Command::Bench { cases, .. } = &command {
-        cases.validate(config.max_model_len as usize)?;
-        Some(bench::run_directory(&cases.output)?)
-    } else {
-        None
-    };
-    if let Command::Offline { jobs, .. } = &command {
-        jobs.validate()?;
-    }
-    if let Command::Accuracy { checks, .. } = &command {
-        checks.validate(config.max_model_len as usize)?;
-    }
-    let mut engine = tokio::select! {
-        result = async {
-            match &command {
-                Command::Serve { listen, .. } => Runtime::start_on(config, *listen).await,
-                Command::Bench { .. } => Runtime::start_benchmark(config, bench_run.as_deref().expect("allocated benchmark directory")).await,
-                _ => Runtime::start(config).await,
-            }
-        } => result?,
-        signal = termination_signal() => {signal?; bail!("interrupted while loading model")},
-    };
-
-    let base_url = engine.base_url.clone();
-    let serving = matches!(command, Command::Serve { .. });
-    let job = async {
-        match &command {
-            Command::Serve { listen, .. } => {
-                eprintln!(
-                    "Serving {} on {listen} (local endpoint {base_url})",
-                    runtime::MODEL_ALIAS
-                );
-                std::future::pending().await
-            }
-            Command::Offline { jobs, .. } => offline::run(jobs, &base_url).await,
-            Command::Bench { cases, runtime } => {
-                bench::run(
-                    cases,
-                    &base_url,
-                    bench_run.as_deref().expect("allocated benchmark directory"),
-                    runtime.devices.split(',').count(),
-                )
-                .await
-            }
-            Command::Accuracy { checks, .. } => accuracy::run(checks, &base_url).await,
-            Command::Capture { .. } | Command::ListCases { .. } => {
-                unreachable!("handled before worker startup")
-            }
+        Command::SchedulerBench => println!(
+            "{}",
+            serde_json::to_string_pretty(&host_observation::report()?)?
+        ),
+        Command::RunHead(options) => head_runner::run(options)?,
+        Command::Inspect { model } => {
+            let report = anyinfer::native::model::inspect(&model)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
-    };
-    let result = tokio::select! {
-        result = job => result,
-        status = engine.wait() => {
-            status.and_then(|()| {
-                anyhow::ensure!(serving, "worker exited before the job completed");
-                Ok(())
-            })
-        },
-        signal = termination_signal() => {
-            signal.and_then(|()| {
-                anyhow::ensure!(serving, "job interrupted");
-                Ok(())
-            })
-        },
-    };
-    engine.shutdown().await;
-    result
+        Command::PrepareHead {
+            model,
+            output,
+            rank,
+            world_size,
+        } => {
+            let report = anyinfer::native::model::prepare_head(&model, &output, rank, world_size)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::ListCases { range } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&opbench::select(&range)?)?
+            );
+        }
+        Command::Bench(args) => opbench::run(&args)?,
+    }
+    Ok(())
 }
